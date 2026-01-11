@@ -9,7 +9,12 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error
+from dotenv import load_dotenv
+import os # Added for os.getenv
 
+load_dotenv()
+
+# (Tahmin bloğu dosya sonuna taşındı)
 # ==============================================================================
 # 1. AYARLAR VE VERİYİ YÜKLEME
 # ==============================================================================
@@ -24,6 +29,10 @@ print(f"🔥 PyTorch cihazı ayarlandı: {device}")
 try:
     df = pd.read_json(FILE_NAME)
     print(f"✅ '{FILE_NAME}' başarıyla yüklendi. Başlangıç Boyutu: {df.shape}")
+    
+    # Sütun isimlerini düzeltme (Scraping çıktısına göre)
+    df.rename(columns={'name': 'Name', 'Overall rating': 'Overall'}, inplace=True)
+
 except FileNotFoundError:
     print(f"❌ Hata: '{FILE_NAME}' dosyası bulunamadı.")
     exit()
@@ -125,7 +134,8 @@ for col in categorical_cols:
 # Kategorik Kodlama (One-Hot Encoding)
 cols_to_encode = ['Position', 'Team', 'Best position']
 existing_cols_to_encode = [col for col in cols_to_encode if col in df.columns]
-df_final = pd.get_dummies(df, columns=existing_cols_to_encode, drop_first=True)
+# One-Hot Encoding (dtype=int ile sayısal olmasını garanti et)
+df_final = pd.get_dummies(df, columns=existing_cols_to_encode, drop_first=True, dtype=int)
 
 # Son Temizlik
 if 'Name' in df_final.columns:
@@ -141,7 +151,10 @@ print(f"✅ Veri temizliği ve kodlama bitti. Son Boyut: {df_final.shape}")
 # ==============================================================================
 
 X = df_final.drop('Value', axis=1)
-Y = df_final[['Value']] # PyTorch için 2D DataFrame olarak sakla
+Y = df_final[['Value']] 
+
+# Tüm X verisini float'a çevir (Scaler hatasını önlemek için kritik)
+X = X.astype(float)
 
 variance = X.var()
 constant_columns = variance[variance == 0].index.tolist()
@@ -154,10 +167,10 @@ X_train_df, X_test_df, Y_train_df, Y_test_df = train_test_split(
 )
 
 # --- X Özelliklerini Ölçeklendirme ---
-numeric_features = X_train_df.select_dtypes(include=np.number).columns
+# Tüm sütunları ölçekle (Frontend ile 1-1 eşleşme için şart)
 x_scaler = StandardScaler()
-X_train_df[numeric_features] = x_scaler.fit_transform(X_train_df[numeric_features])
-X_test_df[numeric_features] = x_scaler.transform(X_test_df[numeric_features])
+X_train_df[:] = x_scaler.fit_transform(X_train_df)
+X_test_df[:] = x_scaler.transform(X_test_df)
 print("✅ X Özellikleri ölçeklendirildi.")
 
 
@@ -379,3 +392,74 @@ model_json = export_model_to_json(model, x_scaler, y_scaler, input_cols)
 # Not: 'loss' değişkeni eğitim döngüsünden gelen son loss değeridir.
 final_loss = loss.item() if 'loss' in locals() else 0.0
 save_to_postgres(model_json, mae, final_loss)
+
+# ==============================================================================
+# 11. TAHMİNLERİ OLUŞTUR VE VERİTABANINA KAYDET (YENİ ÖZELLİK)
+# ==============================================================================
+print("Tüm oyuncular için tahminler oluşturuluyor...")
+
+# Tüm veri seti üzerinde tahmin yap (X_scaled kullanacağız)
+# X zaten float olarak ayarlanmıştı.
+# Tüm veriyi tekrar scale et (Eğitimde fit edilen scaler ile)
+
+X_all_scaled = x_scaler.transform(X)
+X_tensor_all = torch.tensor(X_all_scaled, dtype=torch.float32).to(device)
+
+model.eval()
+with torch.no_grad():
+    predictions_log = model(X_tensor_all).cpu().numpy()
+
+# Ters Log Dönüşümü (Gerçek Değer Tahmini)
+# Önce Scaler'ın tersini al (Z-score -> Log Value)
+predictions_rescaled = y_scaler.inverse_transform(predictions_log)
+# Sonra Log'un tersini al (Log Value -> Euro)
+predictions_eur = np.expm1(predictions_rescaled)
+
+# Sonuçları DataFrame'e ekle
+# Orjinal DataFrame'den isim ve diğer bilgileri alabilmek için, indexleri kullanmamız lazım.
+# df_final üzerinde çalışmıştık ama isimleri atmıştık.
+# En başta 'df' değişkeninde orjinal veri duruyor.
+
+# df ile X aynı indexe sahip olmalı.
+df_results = df.copy() 
+# Temizlik sırasında satır atıldıysa indexler kaymış olabilir, ancak biz dropna yaptık.
+# En garantisi: df_final'in indexlerini kullanmak.
+df_results = df_results.loc[df_final.index]
+
+df_results['Predicted_Value'] = predictions_eur
+df_results['Value_Diff'] = df_results['Predicted_Value'] - df_results['Value']
+
+# Kaydedilecek sütunları seç
+# 'Name' sütunu df'de mevcut.
+columns_to_save = ['Name', 'Age', 'Overall', 'Potential', 'Value', 'Predicted_Value', 'Value_Diff']
+# Eğer 'Nationality' veya 'Team' gibi ek bilgiler istersek buraya ekleyebiliriz.
+
+# Sadece bu sütunları al
+df_save = df_results[columns_to_save].copy()
+
+# Değerleri tam sayıya yuvarla
+df_save['Value'] = df_save['Value'].astype(int)
+df_save['Predicted_Value'] = df_save['Predicted_Value'].astype(int)
+df_save['Value_Diff'] = df_save['Value_Diff'].astype(int)
+
+# Veritabanına Kaydet (players tablosu)
+try:
+    from sqlalchemy import create_engine, text
+    
+    # SQLAlchemy motoru oluştur (Postgres)
+    # POSTGRES_URL: postgresql://admin:admin@localhost:5432/football_db
+    # SQLAlchemy için 'postgresql+psycopg2://...' formatı gerekebilir veya 'postgresql://' yeterli.
+    db_url = os.getenv("POSTGRES_URL").replace("postgresql://", "postgresql+psycopg2://")
+    engine = create_engine(db_url)
+    
+    # Tabloyu (varsa) üzerine yaz
+    df_save.to_sql('players', engine, if_exists='replace', index=False)
+    
+    # Primary Key ekle (Opsiyonel ama iyi olur)
+    # with engine.connect() as con:
+    #     con.execute(text('ALTER TABLE players ADD PRIMARY KEY ("Name");'))
+        
+    print(f"✅ {len(df_save)} oyuncu verisi 'players' tablosuna kaydedildi.")
+    
+except Exception as e:
+    print(f"❌ Oyuncu verileri kaydedilemedi: {e}")

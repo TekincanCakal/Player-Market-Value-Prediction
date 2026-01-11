@@ -43,7 +43,7 @@ export default function PredictionPlayground({ modelJson }: { modelJson: any }) 
         const numericMap: any = {
             'Age': inputs.Age,
             'Age_Squared': inputs.Age * inputs.Age,
-            'Overall': inputs.Overall,
+            'Overall rating': inputs.Overall, // Düzeltme: Model 'Overall rating' bekliyor
             'Potential': inputs.Potential,
             'Wage': inputs.Wage,
             'Contract_Duration': inputs.Contract_Duration
