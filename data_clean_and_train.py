@@ -290,3 +290,92 @@ sample_predictions = pd.DataFrame({
 sample_predictions['Hata'] = abs(sample_predictions['Gerçek Değer'] - sample_predictions['Tahmin Edilen Değer'])
 print("\n📝 Sinir Ağının Örnek Tahminleri (İlk 5):")
 print(sample_predictions.head().sort_values(by='Gerçek Değer', ascending=False))
+
+
+# ==============================================================================
+# 10. VERCEL ENTEGRASYONU: DB LOGLAMA VE JSON EXPORT
+# ==============================================================================
+
+import json
+import os
+import psycopg2
+from datetime import datetime
+
+def export_model_to_json(model, x_scaler, y_scaler, input_columns):
+    """
+    Modelin ağırlıklarını (Weights) ve Scaler parametrelerini 
+    JavaScript tarafında kullanılmak üzere JSON formatına çevirir.
+    """
+    state_dict = model.state_dict()
+    
+    # PyTorch Tensorlarını listeye çevir
+    weights = {}
+    for key, value in state_dict.items():
+        weights[key] = value.cpu().numpy().tolist()
+        
+    export_data = {
+        "timestamp": datetime.now().isoformat(),
+        "model_weights": weights,
+        "x_scaler_mean": x_scaler.mean_.tolist(),
+        "x_scaler_scale": x_scaler.scale_.tolist(),
+        "y_scaler_mean": y_scaler.mean_.tolist(),
+        "y_scaler_scale": y_scaler.scale_.tolist(),
+        "input_columns": input_columns.tolist(),
+        "mae_score": float(mae)
+    }
+    
+    return json.dumps(export_data)
+
+def save_to_postgres(json_data, mae_score, loss):
+    """
+    Eğitim sonuçlarını ve model JSON'ını Vercel Postgres'e kaydeder.
+    """
+    db_url = os.environ.get("POSTGRES_URL")
+    if not db_url:
+        print("⚠️ POSTGRES_URL bulunamadı, DB'ye kayıt yapılmadı. (Sadece yerel test mi?)")
+        # Yerel test için dosyaya yaz
+        with open("model_export.json", "w", encoding="utf-8") as f:
+            f.write(json_data)
+        print("✅ Model 'model_export.json' olarak yerel diske kaydedildi.")
+        return
+
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        
+        # Tabloları oluştur (Yoksa)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS training_logs (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                mae_score FLOAT,
+                final_loss FLOAT,
+                model_json JSONB
+            );
+        """)
+        
+        # Veriyi ekle
+        cur.execute("""
+            INSERT INTO training_logs (mae_score, final_loss, model_json)
+            VALUES (%s, %s, %s)
+        """, (mae_score, loss, json_data))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Eğitim sonuçları ve Model JSON Vercel Postgres'e başarıyla kaydedildi!")
+        
+    except Exception as e:
+        print(f"❌ DB Kayıt Hatası: {e}")
+
+# JSON Verisini Hazırla
+print("🔄 Model JSON formatına dönüştürülüyor...")
+# Input columns sıralamasını kaydetmek önemli (Frontend'de aynı sırayla özellik vektörü oluşturmak için)
+input_cols = X.columns 
+
+model_json = export_model_to_json(model, x_scaler, y_scaler, input_cols)
+
+# DB'ye Kaydet
+# Not: 'loss' değişkeni eğitim döngüsünden gelen son loss değeridir.
+final_loss = loss.item() if 'loss' in locals() else 0.0
+save_to_postgres(model_json, mae, final_loss)
